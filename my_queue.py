@@ -2,7 +2,7 @@ import logging
 import time
 import random
 import threading
-from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from repository import Repository
@@ -11,84 +11,101 @@ from models import TaskStatus, TaskInfo, Task
 
 class TaskQueue:
     """
-    Class that manages a queue of tasks with a limit on the number of tasks executed simultaneously.
+    TaskQueue manages the execution of tasks using a queue system, ensuring that at most
+    two tasks run concurrently. It automatically picks tasks from the queue and executes
+    them as workers become available.
 
     Attributes:
-    - queue (deque): The task queue.
-    - tasks (dict): Dict with all tasks
-    - db (Repository): repository to save tasks
-    - lock (threading.Lock): Lock for synchronizing access to task counters.
-    - max_running_tasks (int): Maximum number of tasks that can run simultaneously.
-    - running_tasks (int): Current number of tasks being executed.
-    - task_id_counter (int): Counter for generating unique task IDs.
-    - task_lock (threading.Lock): Lock for synchronizing access to the task queue.
-    - condition (threading.Condition): Condition variable for controlling the worker thread.
-    - worker_thread (threading.Thread): Background thread that processes tasks from the queue.
+        tasks (dict): Stores task objects by their unique task ID.
+        queue (list): Holds the task IDs in the order they were added.
+        db (Repository): Repository to save tasks.
+        lock (Lock): Ensures thread-safe access to shared resources.
+        executor (ThreadPoolExecutor): A thread pool that runs tasks, limited to 2 concurrent workers.
+        task_id_counter (int): Counter for generating unique task IDs.
     """
     def __init__(self, db: Repository):
-        self.queue = deque()
         self.tasks = {}
+        self.queue = []
         self.db = db
         self.lock = threading.Lock()
-        self.max_running_tasks = 2
-        self.running_tasks = 0
         self.task_id_counter = 1
-        self.task_lock = threading.Lock()
-        self.condition = threading.Condition(self.lock)
-        self.worker_thread = threading.Thread(target=self._worker)
-        self.worker_thread.daemon = True
-        self.worker_thread.start()
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.active_futures = set()
 
-    def add_task(self) -> int:
+    def add_task(self):
         """
-        Adds a new task to the queue and notifies the worker thread.
+        Adds a new task to the queue and returns its unique task ID.
 
         Returns:
-        - int: Unique identifier of the created task.
+            int: The unique task ID of the added task.
         """
-        with self.task_lock:
+        with self.lock:
             task_id = self.task_id_counter
             self.task_id_counter += 1
-            logging.info(f"[TaskQueue:add_task] task {task_id} added in queue. Queue len = {len(self.queue)}")
-
             task = Task(task_id)
-            self.tasks.update({task_id: task})
-            self.queue.append(task)
-
-        with self.condition:
-            self.condition.notify()
-
+            self.tasks[task_id] = task
+            self.queue.append(task_id)
         return task_id
 
-    def _worker(self):
+    def _run_task(self, task):
         """
-        Worker thread that continuously checks the task queue and executes tasks as they become available.
+        Simulates running a task by sleeping for a random amount of time between 1 and 10 seconds.
+        Updates the task's status once complete.
 
-        Executes tasks while respecting the limit on the number of simultaneously running tasks.
+        Args:
+            task (Task): The task object to be executed.
+        """
+        task.exec_time = random.randint(1, 10)
+        task.start_time = datetime.now()
+        time.sleep(task.exec_time)
+        with self.lock:
+            task.status = TaskStatus.COMPLETED
+            task.end_time = time.time()
+            time_delta = datetime.now() - task.start_time
+            task.exec_time = time_delta.total_seconds()
+            self.db.write_task(task=task)
+        logging.info(f"[TaskQueue:add_task] {task.task_id} stopped after {task.exec_time}")
+
+    def _task_cleanup(self, future, task_id):
+        """
+        Callback function to be executed once the task is completed.
+        It removes the completed task from the active futures set.
+
+        Args:
+            future (concurrent.futures.Future): The future representing the task.
+        """
+        with self.lock:
+            self.active_futures.remove(future)
+
+    def start_processing(self):
+        """
+        Starts a continuous process that monitors the task queue and submits tasks to the executor
+        as long as there are tasks in the queue and fewer than two tasks running.
         """
         while True:
-            with self.condition:
-                while not self.queue or self.running_tasks >= self.max_running_tasks:
-                    self.condition.wait()
-
-                task = self.queue.popleft()
-                task.status = TaskStatus.RUN
-                task.start_time = datetime.now()
-                logging.info(f"[TaskQueue:add_task] {task.task_id} started")
-                self.running_tasks += 1
-
-            time.sleep(random.randint(0, 10))
-
             with self.lock:
-                task.status = TaskStatus.COMPLETED
-                time_delta = datetime.now() - task.start_time
-                task.exec_time = time_delta.total_seconds()
-                self.db.write_task(task=task)
-                logging.info(f"[TaskQueue:add_task] {task.task_id} stopped after {task.exec_time}")
-                self.running_tasks -= 1
+                while len(self.active_futures) < 2 and self.queue:
+                    task_id = self.queue.pop(0)
+                    task = self.tasks[task_id]
+                    task.status = TaskStatus.RUN
+                    logging.info(f"[TaskQueue:start_processing] {task.task_id} started")
+
+                    future = self.executor.submit(self._run_task, task)
+                    future.add_done_callback(lambda f: self._task_cleanup(f, task_id))
+                    self.active_futures.add(future)
+            time.sleep(1)
+
+
+    def start_background_worker(self):
+        """
+        Starts a background thread that runs the task processing loop continuously.
+        """
+        worker_thread = threading.Thread(target=self.start_processing)
+        worker_thread.daemon = True
+        worker_thread.start()
 
     def get_task_status(self, task_id: int) -> TaskInfo:
-        with self.task_lock:
+        with self.lock:
             task = self.tasks.get(task_id)
             if task:
                 return TaskInfo(

@@ -95,6 +95,7 @@ class Repository:
         
     @sql_query
     def write_task(self, cursor, task: Task):
+        print(task)
         query = """
                 INSERT INTO tasks (id, create_time, start_time, exec_time) 
                 VALUES (%s, %s, %s, %s);

@@ -1,3 +1,5 @@
+from threading import Thread
+
 from models import TaskInfo
 from repository import Repository
 from my_queue import TaskQueue
@@ -12,6 +14,7 @@ class TaskManager:
     """
     def __init__(self, db: Repository):
         self.task_queue = TaskQueue(db=db)
+        Thread(target=self.task_queue.start_processing).start()
 
     def create_task(self) -> dict:
         task_id = self.task_queue.add_task()
